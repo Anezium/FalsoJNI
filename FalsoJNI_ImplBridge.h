@@ -15,6 +15,7 @@
 #define FALSOJNI_IMPL_BRIDGE
 
 #include <stddef.h>
+#include <stdint.h>
 #include "jni.h"
 
 /*
@@ -152,6 +153,44 @@ jboolean jstr_utf8_to_utf16(JavaString * jstr);
  * Helper macros / functions
  */
 
+/*
+ * Arguments of the Call*MethodA / NewObjectA variants.
+ *
+ * The A variants receive their arguments as a jvalue array, but method
+ * implementations read them with va_arg. A function cannot build a va_list
+ * out of an array, so FJNI_A_ARGS lays out, in a buffer that lives in the
+ * caller's frame, the bytes a variadic call would have produced, and points
+ * a va_list at them.
+ *
+ * The layout is the one va_arg walks under the ARM procedure call standard
+ * (AAPCS): every argument goes through the default promotions (jboolean,
+ * jbyte, jchar and jshort become int, jfloat becomes double) and takes a
+ * 4-byte slot; 64-bit values (jlong, jdouble and the promoted jfloat) start
+ * on an 8-byte boundary. Argument types come from the signature passed to
+ * GetMethodID / GetStaticMethodID, recorded per method ID. Methods are
+ * resolved by name, so overloads share an ID and the last signature wins.
+ *
+ * Implementations read A-variant arguments exactly like those of the ... and
+ * V variants: va_arg(args, int) for Z, B, C, S and I, va_arg(args, jlong) for
+ * J, va_arg(args, double) for F and D, va_arg(args, jobject) for objects and
+ * arrays.
+ */
+#define FJNI_A_ARGS_MAX_BYTES 512
+
+void fjni_remember_signature(jmethodID id, const char *sig);
+void fjni_jvalues_to_va_list(jmethodID id, const jvalue *args, uint64_t *area, va_list *out);
+
+#define FJNI_A_ARGS(va, id, args) \
+    uint64_t va##_area[FJNI_A_ARGS_MAX_BYTES / sizeof(uint64_t)]; \
+    va_list va; \
+    fjni_jvalues_to_va_list((id), (args), va##_area, &va)
+
+/*
+ * Deprecated: returns a va_list that points into _AtoV's own stack frame,
+ * already released when the caller uses it, and that holds the jvalue pointer
+ * rather than the values. Kept so that existing code still compiles; use
+ * FJNI_A_ARGS instead.
+ */
 va_list _AtoV(int dummy, ...);
 
 #define getFieldValueById(jtype, fieldtype, containertype, container, containersize, id, defaultval) ({ \

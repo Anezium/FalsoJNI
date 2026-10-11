@@ -376,3 +376,119 @@ va_list _AtoV(int dummy, ...) {
     va_end(args1);
     return args2;
 }
+
+/*
+ * Method signatures, recorded by GetMethodID / GetStaticMethodID for
+ * fjni_jvalues_to_va_list(). A fixed table filled with atomic operations:
+ * an entry's id is published after its signature, so a concurrent reader
+ * either skips the entry or sees it complete.
+ */
+#define FJNI_MAX_SIGNATURES 1024
+
+static struct {
+    volatile int id;
+    const char * volatile sig;
+} method_signatures[FJNI_MAX_SIGNATURES];
+static volatile int method_signatures_count = 0;
+
+static int find_signature_slot(jmethodID id) {
+    int n = method_signatures_count;
+    if (n > FJNI_MAX_SIGNATURES) n = FJNI_MAX_SIGNATURES;
+    for (int i = 0; i < n; i++) {
+        if (method_signatures[i].id == (int)id)
+            return i;
+    }
+    return -1;
+}
+
+void fjni_remember_signature(jmethodID id, const char *sig) {
+    if (!id || !sig)
+        return;
+
+    int i = find_signature_slot(id);
+    if (i >= 0) {
+        if (strcmp(method_signatures[i].sig, sig) != 0)
+            method_signatures[i].sig = strdup(sig); // overload: the last signature wins
+        return;
+    }
+
+    i = __sync_fetch_and_add(&method_signatures_count, 1);
+    if (i >= FJNI_MAX_SIGNATURES) {
+        fjni_logv_err("signature table full (%i), Call*MethodA cannot pass the arguments of method ID %i",
+                      FJNI_MAX_SIGNATURES, (int)id);
+        return;
+    }
+    method_signatures[i].sig = strdup(sig);
+    __sync_synchronize();
+    method_signatures[i].id = (int)id;
+}
+
+#if !defined(__arm__) || defined(__aarch64__)
+#error "fjni_jvalues_to_va_list() builds an ARM AAPCS va_list; port it before using another ABI"
+#endif
+
+void fjni_jvalues_to_va_list(jmethodID id, const jvalue *args, uint64_t *area, va_list *out) {
+    _Static_assert(sizeof(va_list) == sizeof(void *), "the AAPCS va_list is a single pointer");
+
+    uint8_t *base = (uint8_t *)area;
+    size_t off = 0;
+    int slot = find_signature_slot(id);
+    const char *sig = slot >= 0 ? method_signatures[slot].sig : NULL;
+
+    memset(area, 0, FJNI_A_ARGS_MAX_BYTES);
+
+    if (!sig || sig[0] != '(') {
+        // The method reads zeros instead of the arguments.
+        fjni_logv_err("no signature recorded for method ID %i, its arguments are not passed", (int)id);
+        sig = "()";
+    }
+
+    const char *p = sig + 1;
+    for (int n = 0; *p && *p != ')'; n++) {
+        char type;
+        int array = 0;
+
+        while (*p == '[') {
+            array = 1;
+            p++;
+        }
+        type = *p;
+        if (type == 'L') {
+            p = strchr(p, ';');
+            if (!p) {
+                fjni_logv_err("malformed signature \"%s\" (method ID %i)", sig, (int)id);
+                break;
+            }
+        }
+        if (*p) p++;
+        if (array) type = 'L'; // arrays travel as jobject references
+
+        size_t size = (type == 'J' || type == 'D' || type == 'F') ? 8 : 4;
+        off = (off + size - 1) & ~(size - 1);
+        if (off + size > FJNI_A_ARGS_MAX_BYTES) {
+            fjni_logv_err("arguments of method ID %i exceed %i bytes, truncated", (int)id, FJNI_A_ARGS_MAX_BYTES);
+            break;
+        }
+
+        void *dst = base + off;
+        switch (type) {
+            case 'Z': *(int32_t *)dst = args[n].z; break;
+            case 'B': *(int32_t *)dst = args[n].b; break;
+            case 'C': *(int32_t *)dst = args[n].c; break;
+            case 'S': *(int32_t *)dst = args[n].s; break;
+            case 'I': *(int32_t *)dst = args[n].i; break;
+            case 'J': *(int64_t *)dst = args[n].j; break;
+            case 'F': *(double *)dst = (double)args[n].f; break;
+            case 'D': *(double *)dst = args[n].d; break;
+            case 'L': *(jobject *)dst = args[n].l; break;
+            default:
+                fjni_logv_err("unknown type '%c' in signature \"%s\" (method ID %i)", type, sig, (int)id);
+                *(int32_t *)dst = args[n].i;
+                break;
+        }
+        off += size;
+    }
+
+    void *ap = base;
+    memcpy(out, &ap, sizeof(ap));
+}
